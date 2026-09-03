@@ -82,7 +82,9 @@ async def handle_signaling(websocket):
         async for message in websocket:
             data = json.loads(message)
             if data["type"] == "offer":
-                offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+                # Fix for aiortc crash: strip problematic extmap lines from modern browsers
+                clean_sdp = "\r\n".join([line for line in data["sdp"].splitlines() if not line.startswith("a=extmap")])
+                offer = RTCSessionDescription(sdp=clean_sdp, type=data["type"])
                 await pc.setRemoteDescription(offer)
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)

@@ -1,0 +1,15 @@
+# Virtual environments
+venv/
+env/
+__pycache__/
+
+# Node
+node_modules/
+.next/
+
+# Logs
+*.log
+*.pid
+
+# Images/Outputs
+*.png

@@ -33,10 +33,8 @@ export default function CloudPlayer({ gameId }: { gameId: string }) {
 
     const startSession = async () => {
       try {
-        // Use Google's public STUN server so mobile devices can generate ICE candidates properly
-        pc = new RTCPeerConnection({
-          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        });
+        // Remove STUN to speed up local LAN ICE gathering (prevents hanging)
+        pc = new RTCPeerConnection({});
 
         // Handle incoming video stream
         pc.ontrack = (event) => {
@@ -55,30 +53,49 @@ export default function CloudPlayer({ gameId }: { gameId: string }) {
         dcRef.current = pc.createDataChannel('input_channel');
         dcRef.current.onopen = () => console.log('Data channel opened');
         
-        // Connect to signaling server (our Python Streamer)
-        // We now route the WebSocket through the Next.js proxy on the exact same port!
+        // Connect to signaling server
         const wsUrl = `ws://${window.location.host}/ws`;
         ws = new WebSocket(wsUrl);
 
         ws.onopen = async () => {
           setStatus('Negotiating...');
           
-          // Pillar 4: Tell the Python server to launch the Steam game!
+          // Tell the Python server to launch the Steam game
           ws.send(JSON.stringify({
             type: 'launch',
             gameId: gameId
           }));
           
-          // Explicitly tell the server we want to receive video!
-          // Without this, the offer is empty and the python server crashes!
+          // Explicitly tell the server we want to receive video
           pc.addTransceiver('video', { direction: 'recvonly' });
           
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
-          ws.send(JSON.stringify({
-            type: pc.localDescription?.type,
-            sdp: pc.localDescription?.sdp
-          }));
+          
+          let offerSent = false;
+          // Helper to send the offer once candidates are gathered
+          const sendOffer = () => {
+            if (offerSent) return;
+            offerSent = true;
+            ws.send(JSON.stringify({
+              type: pc.localDescription?.type,
+              sdp: pc.localDescription?.sdp
+            }));
+          };
+
+          // Wait for ICE gathering to complete before sending SDP 
+          // because the Python server doesn't support Trickle ICE yet
+          if (pc.iceGatheringState === 'complete') {
+            sendOffer();
+          } else {
+            pc.onicegatheringstatechange = () => {
+              if (pc.iceGatheringState === 'complete') {
+                sendOffer();
+              }
+            };
+            // Fallback timeout in case mobile ICE gathering hangs
+            setTimeout(sendOffer, 1500);
+          }
         };
 
         ws.onmessage = async (event) => {

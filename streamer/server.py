@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import subprocess
-from aiortc import RTCPeerConnection, RTCSessionDescription
+import time
+import os
+import fractions
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaPlayer
 import websockets
 from pynput.keyboard import Controller, Key
@@ -27,34 +30,157 @@ special_keys = {
 
 logging.basicConfig(level=logging.INFO)
 
+def create_obs_autostream_json(window_string):
+    obs_dir = os.path.expanduser("~/.config/obs-studio/basic/scenes")
+    os.makedirs(obs_dir, exist_ok=True)
+    json_path = os.path.join(obs_dir, "AutoStream.json")
+    
+    collection = {
+        "current_scene": "Scene",
+        "current_program_scene": "Scene",
+        "name": "AutoStream",
+        "scene_order": [{"name": "Scene"}],
+        "sources": [
+            {
+                "name": "Scene",
+                "id": "scene",
+                "settings": {
+                    "items": [
+                        {
+                            "name": "GameCapture",
+                            "source_uuid": "11111111-1111-1111-1111-111111111111",
+                            "visible": True,
+                            "locked": False,
+                            "id": 1
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "GameCapture",
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "id": "xcomposite_input",
+                "settings": {
+                    "window": window_string
+                }
+            }
+        ]
+    }
+    with open(json_path, 'w') as f:
+        json.dump(collection, f, indent=4)
+    logging.info(f"Created OBS AutoStream.json for window string: {repr(window_string)}")
+
+class SwitchingTrack(VideoStreamTrack):
+    def __init__(self, placeholder):
+        super().__init__()
+        self.placeholder = placeholder
+        self.game = None
+        self._start_time = None
+        
+    async def recv(self):
+        track = self.game if self.game else self.placeholder
+        frame = await track.recv()
+        
+        if self._start_time is None:
+            self._start_time = time.time()
+            
+        frame.pts = int((time.time() - self._start_time) * 90000)
+        frame.time_base = fractions.Fraction(1, 90000)
+        return frame
+
+async def monitor_game(track, game_id):
+    logging.info(f"Monitoring for game window: steam_app_{game_id} or fullscreen")
+    import os
+    
+    # 1. Loop every 2 seconds to check if the game is running
+    while True:
+        game_running = False
+        try:
+            out = subprocess.check_output(["wmctrl", "-l"]).decode()
+            for line in out.splitlines():
+                if f"steam_app_{game_id}" in line.lower() or "steam_app" in line.lower() or "p3r" in line.lower():
+                    game_running = True
+                    break
+        except Exception:
+            pass
+
+        if not game_running:
+            logging.info("Waiting for Persona 3 Reload to start...")
+            await asyncio.sleep(2.0)
+            continue
+            
+        logging.info("Game window detected! Launching OBS Studio...")
+        
+        # 2. Check if OBS is already running, if not, launch it
+        obs_running = False
+        try:
+            subprocess.check_output(["pgrep", "obs"])
+            obs_running = True
+        except subprocess.CalledProcessError:
+            pass
+
+        if not obs_running:
+            # Generate the OBS collection for this specific game
+            create_obs_autostream_json(f"steam_app_{game_id}")
+            
+            subprocess.Popen(
+                ["obs", "--collection", "AutoStream", "--startvirtualcam", "--minimize-to-tray"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            await asyncio.sleep(4.0) # Give OBS time to start the virtual camera
+            
+        # 3. Connect to the Virtual Camera
+        obs_device = None
+        for i in range(10):
+            name_path = f"/sys/class/video4linux/video{i}/name"
+            try:
+                with open(name_path, 'r') as f:
+                    if "OBS Virtual Camera" in f.read():
+                        obs_device = f"/dev/video{i}"
+                        break
+            except FileNotFoundError:
+                pass
+
+        if obs_device:
+            try:
+                screen_player = MediaPlayer(obs_device, format='v4l2')
+                track.game = screen_player.video
+                logging.info(f"Successfully connected to OBS Virtual Camera at {obs_device}! Streaming to phone.")
+                
+                # Keep checking if game is still running while streaming
+                while game_running:
+                    await asyncio.sleep(2.0)
+                    game_running = False
+                    try:
+                        out = subprocess.check_output(["wmctrl", "-l"]).decode()
+                        for line in out.splitlines():
+                            if f"steam_app_{game_id}" in line.lower() or "steam_app" in line.lower() or "p3r" in line.lower():
+                                game_running = True
+                                break
+                    except Exception:
+                        pass
+                
+                logging.info("Game closed. Stopping stream...")
+                track.game = None
+                
+            except Exception as e:
+                logging.info(f"Waiting for OBS Virtual Camera to initialize...")
+                await asyncio.sleep(2.0)
+        else:
+            logging.info("Waiting for OBS Virtual Camera device to appear...")
+            await asyncio.sleep(2.0)
+
 async def handle_signaling(websocket):
     logging.info("Client connected for signaling")
     pc = RTCPeerConnection()
     
-    # Auto-start OBS Studio if it's not already running
-    try:
-        if subprocess.run(["pgrep", "-x", "obs"], capture_output=True).returncode != 0:
-            logging.info("OBS not running. Auto-starting OBS with Virtual Camera...")
-            subprocess.Popen(["obs", "--startvirtualcam", "--minimize-to-tray"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        logging.error(f"Failed to check/start OBS: {e}")
-        
-    # Use v4l2 virtual camera to flawlessly capture the screen on Wayland (Hyprland)
-    # The user can use OBS Studio "Virtual Camera" to pipe the screen here!
-    player = None
-    for attempt in range(20):
-        try:
-            player = MediaPlayer('/dev/video2', format='v4l2', options={'fflags': 'nobuffer', 'flags': 'low_delay'})
-            break
-        except Exception as e:
-            logging.warning(f"Video device busy, retrying in 0.5s... ({e})")
-            await asyncio.sleep(0.5)
+    # 1. Setup the loading screen video player
+    placeholder_player = MediaPlayer('loading.mp4', loop=True)
     
-    if not player:
-        logging.error("Could not open /dev/video2. Is OBS Virtual Camera running?")
-        return
-        
-    pc.addTrack(player.video)
+    # Create the switching track
+    video_track = SwitchingTrack(placeholder_player.video)
+    pc.addTransceiver(video_track, direction="sendonly")
     
     @pc.on("datachannel")
     def on_datachannel(channel):
@@ -66,23 +192,21 @@ async def handle_signaling(websocket):
                 event_type = data.get("type")
                 key_str = data.get("key")
                 
-                # Map browser key string to pynput Key object if it's special
                 k = special_keys.get(key_str, key_str)
                 
                 if event_type == "keydown":
-                    logging.info(f"KeyDown: {key_str}")
                     keyboard.press(k)
                 elif event_type == "keyup":
-                    logging.info(f"KeyUp: {key_str}")
                     keyboard.release(k)
             except Exception as e:
                 logging.error(f"Input error: {e}")
+
+    monitor_task = None
 
     try:
         async for message in websocket:
             data = json.loads(message)
             if data["type"] == "offer":
-                # Fix for aiortc crash: strip problematic extmap lines from modern browsers
                 clean_sdp = "\r\n".join([line for line in data["sdp"].splitlines() if not line.startswith("a=extmap")])
                 offer = RTCSessionDescription(sdp=clean_sdp, type=data["type"])
                 await pc.setRemoteDescription(offer)
@@ -97,14 +221,16 @@ async def handle_signaling(websocket):
                 logging.info(f"Launching Steam game: {game_id}")
                 try:
                     subprocess.Popen(["steam", "-applaunch", str(game_id)])
+                    # Start monitoring for the game window
+                    monitor_task = asyncio.create_task(monitor_game(video_track, game_id))
                 except Exception as e:
                     logging.error(f"Failed to launch steam: {e}")
     except websockets.exceptions.ConnectionClosed:
         logging.info("Client disconnected")
     finally:
+        if monitor_task:
+            monitor_task.cancel()
         await pc.close()
-        if player:
-            player.video.stop()
 
 async def main():
     logging.info("Starting WebRTC Signaling Server on ws://0.0.0.0:3001")

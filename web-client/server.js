@@ -37,7 +37,7 @@ app.prepare().then(() => {
     }
   });
 
-  server.listen(3000, (err) => {
+  server.listen(3000, '0.0.0.0', (err) => {
     if (err) throw err;
     console.log('> Web+WebSocket Server ready on http://0.0.0.0:3000');
   });
